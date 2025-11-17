@@ -1,7 +1,7 @@
 # =================
 # algo_two_phase.py
 # =================
-# Two-Phase planning (NS vs EW) with short demo timings for STEM model.
+# Two-Phase (NS vs EW) planning with short demo timings (5..12 s).
 
 from dataclasses import dataclass
 
@@ -16,7 +16,7 @@ DELTA_HYS = 2        # hysteresis threshold (cars)
 
 @dataclass
 class Cycle:
-    order: str        # "NS" or "EW" starts first
+    order: str        # "NS" or "EW" (who starts)
     ns_green_ms: int
     ew_green_ms: int
     amber_ms:   int
@@ -26,12 +26,11 @@ def _clamp(v, a, b):
     return max(a, min(b, v))
 
 def plan_cycle(N: int, S: int, E: int, W: int, last_order: str = "NS") -> Cycle:
-    """Return a Cycle given current counts. Hysteresis keeps last order if near tie."""
+    """Compute a cycle given N,S,E,W counts. Hysteresis keeps last_order on near ties."""
     ns = max(0, int(N)) + max(0, int(S))
     ew = max(0, int(E)) + max(0, int(W))
     qavg = (ns + ew) / 2.0
 
-    # choose who starts
     if abs(ns - ew) < DELTA_HYS:
         order = last_order
     else:
