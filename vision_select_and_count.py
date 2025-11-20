@@ -1,10 +1,4 @@
-"""Utilities for selecting ROIs and counting cars crossing a line in each ROI.
-
-This module is intentionally self-contained so it can be used both by humans (to
-visualise the counting overlay) and by :mod:`iot_publisher` which imports the
-:func:`count_stream` generator.  The generator emits the number of cars detected
-in the last window for the four directions N, S, E and W.
-"""
+"""ROI selection + car counting utilities for the Smart Road demo."""
 
 from __future__ import annotations
 
@@ -19,194 +13,177 @@ from typing import Dict, Iterable, Iterator, List, Tuple
 import cv2
 import numpy as np
 
-# ---- Settings ----
 CAM_INDEX = 0
-FRAME_W, FRAME_H = 1280, 720
-MIN_AREA = 500  # minimum contour area inside each ROI
-LINE_POS = 0.6  # counting line position (fraction inside ROI)
-BAND_FRAC = 0.08  # +/- band around the line (fraction of min(w, h))
-PRINT_EVERY = 1.0  # seconds
+FRAME_W = 1280
+FRAME_H = 720
+MIN_AREA = 500
+LINE_POS = 0.6
+BAND_FRAC = 0.08
+ERODE_ITER = 1
+DILATE_ITER = 2
+PRINT_EVERY = 1.0
+MAX_TRACK_DIST = 40.0
+TRACK_TTL = 0.8
 ROI_CFG = "roi_config.json"
 
-# A simple queue to publish live counts to other modules
-_counts_q: "queue.Queue[Dict[str, int]]" = queue.Queue(maxsize=1)
+CountsDict = Dict[str, int]
+
+_counts_queue: "queue.Queue[CountsDict]" = queue.Queue(maxsize=1)
 
 
-def get_counts_queue() -> "queue.Queue[Dict[str, int]]":
-    """Return the queue containing the latest counts snapshot."""
+def get_counts_queue() -> "queue.Queue[CountsDict]":
+    """Return a queue that always holds the latest counts snapshot."""
 
-    return _counts_q
+    return _counts_queue
+
+
+@dataclass
+class Track:
+    x: float
+    y: float
+    pos: float
+    counted: bool
+    last_seen: float
 
 
 @dataclass
 class ROIState:
     name: str
-    rect: Tuple[int, int, int, int]  # (x, y, w, h) in the original frame
-    orient: str  # 'h' for N/S, 'v' for E/W
-    bs: cv2.BackgroundSubtractor  # background subtractor
+    rect: Tuple[int, int, int, int]
+    orient_x: bool
     line_px: int
     band_px: int
-    tracks: Dict[int, Dict[str, float]] = field(default_factory=dict)
+    subtractor: cv2.BackgroundSubtractor
+    tracks: Dict[int, Track] = field(default_factory=dict)
     next_id: int = 0
-
-
-def _within(val: float, center: float, band: float) -> bool:
-    return abs(val - center) <= band
 
 
 def _select_or_load_rois(frame: np.ndarray) -> Dict[str, Tuple[int, int, int, int]]:
     if os.path.exists(ROI_CFG):
-        with open(ROI_CFG, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return {k: tuple(map(int, v)) for k, v in data.items()}
+        with open(ROI_CFG, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return {name: tuple(map(int, rect)) for name, rect in data.items()}
 
-    print("Select 4 ROIs in order: N, S, E, W (drag mouse, ENTER after each, ESC to finish)")
-    rects = cv2.selectROIs("Select 4 ROIs", frame, showCrosshair=True, fromCenter=False)
+    print("Select ROIs in order N, S, E, W (ENTER to confirm each, ESC to finish).")
+    rois = cv2.selectROIs("Select 4 ROIs", frame, showCrosshair=True, fromCenter=False)
     cv2.destroyWindow("Select 4 ROIs")
-    if len(rects) != 4:
-        raise RuntimeError("You must select exactly 4 ROIs (N, S, E, W).")
-    rois = {
-        "N": tuple(map(int, rects[0])),
-        "S": tuple(map(int, rects[1])),
-        "E": tuple(map(int, rects[2])),
-        "W": tuple(map(int, rects[3])),
+    if len(rois) != 4:
+        raise RuntimeError("Need exactly 4 ROIs.")
+    mapping = {
+        "N": tuple(map(int, rois[0])),
+        "S": tuple(map(int, rois[1])),
+        "E": tuple(map(int, rois[2])),
+        "W": tuple(map(int, rois[3])),
     }
-    with open(ROI_CFG, "w", encoding="utf-8") as f:
-        json.dump(rois, f, indent=2)
-    print(f"Saved ROI configuration to {ROI_CFG}.")
-    return rois
+    with open(ROI_CFG, "w", encoding="utf-8") as fh:
+        json.dump(mapping, fh, indent=2)
+    print(f"Saved ROI config to {ROI_CFG}.")
+    return mapping
 
 
-def _make_roi_state(name: str, rect: Tuple[int, int, int, int]) -> ROIState:
+def _make_state(name: str, rect: Tuple[int, int, int, int]) -> ROIState:
     x, y, w, h = rect
-    orient = "h" if name in {"N", "S"} else "v"
-    extent = h if orient == "h" else w
-    band_base = max(1, min(w, h))
+    orient_x = name in {"E", "W"}
+    extent = w if orient_x else h
     line_px = int(extent * LINE_POS)
-    band_px = max(2, int(band_base * BAND_FRAC))
-    bs = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=25, detectShadows=False)
-    return ROIState(name=name, rect=(x, y, w, h), orient=orient, bs=bs, line_px=line_px, band_px=band_px)
+    band_px = max(2, int(min(w, h) * BAND_FRAC))
+    subtractor = cv2.createBackgroundSubtractorMOG2(
+        history=500, varThreshold=25, detectShadows=False
+    )
+    return ROIState(name=name, rect=(x, y, w, h), orient_x=orient_x, line_px=line_px, band_px=band_px, subtractor=subtractor)
 
 
-def _match_track(state: ROIState, cx: float, cy: float) -> int:
-    """Return the track id that best matches the centroid, or -1 for a new one."""
+def _detect(state: ROIState, roi_frame: np.ndarray) -> List[Tuple[float, float]]:
+    gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
+    mask = state.subtractor.apply(gray)
+    mask = cv2.erode(mask, None, iterations=ERODE_ITER)
+    mask = cv2.dilate(mask, None, iterations=DILATE_ITER)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    detections: List[Tuple[float, float]] = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < MIN_AREA:
+            continue
+        x, y, w, h = cv2.boundingRect(c)
+        detections.append((x + w / 2.0, y + h / 2.0))
+    return detections
 
-    best_id = -1
+
+def _assign_track(state: ROIState, cx: float, cy: float) -> int:
+    best = -1
     best_dist = float("inf")
     for track_id, track in state.tracks.items():
-        dx = track["x"] - cx
-        dy = track["y"] - cy
-        dist = math.hypot(dx, dy)
+        dist = math.hypot(track.x - cx, track.y - cy)
         if dist < best_dist:
             best_dist = dist
-            best_id = track_id
-    if best_dist < 40.0:  # heuristically chosen; works for close consecutive frames
-        return best_id
+            best = track_id
+    if best_dist <= MAX_TRACK_DIST:
+        return best
     return -1
 
 
 def _update_tracks(state: ROIState, detections: Iterable[Tuple[float, float]], now: float) -> int:
-    """Update tracks with the provided detections and return the number of crossings."""
-
     crossings = 0
     line = state.line_px
     band = state.band_px
-    orient_x = state.orient == "v"
-
-    updated: Dict[int, Dict[str, float]] = {}
 
     for cx, cy in detections:
-        track_id = _match_track(state, cx, cy)
+        track_id = _assign_track(state, cx, cy)
         if track_id == -1:
             track_id = state.next_id
             state.next_id += 1
-            prev_pos = cy if not orient_x else cx
+            prev_pos = cy if not state.orient_x else cx
         else:
-            prev_pos = state.tracks[track_id]["pos"]
-        pos = cy if not orient_x else cx
-
-        counted = state.tracks.get(track_id, {}).get("counted", False)
-        if not counted and _within(pos, line, band):
-            if (prev_pos < line <= pos) or (prev_pos > line >= pos):
+            prev_pos = state.tracks[track_id].pos
+        pos = cy if not state.orient_x else cx
+        counted = state.tracks.get(track_id, Track(cx, cy, pos, False, now)).counted
+        if not counted:
+            min_pos = min(prev_pos, pos)
+            max_pos = max(prev_pos, pos)
+            if min_pos <= line - band and max_pos >= line + band:
                 counted = True
                 crossings += 1
-        updated[track_id] = {"x": cx, "y": cy, "pos": pos, "counted": counted, "last": now}
+        state.tracks[track_id] = Track(x=cx, y=cy, pos=pos, counted=counted, last_seen=now)
 
-    # Keep tracks that were seen recently to avoid losing context on short occlusions.
-    for track_id, track in state.tracks.items():
-        if track_id in updated:
-            continue
-        if now - track["last"] < 0.5:
-            updated[track_id] = track
-
-    state.tracks = updated
+    # Remove stale tracks
+    expired = [tid for tid, track in state.tracks.items() if now - track.last_seen > TRACK_TTL]
+    for tid in expired:
+        state.tracks.pop(tid, None)
     return crossings
 
 
-def _process_roi(state: ROIState, frame: np.ndarray, now: float) -> int:
-    mask = state.bs.apply(frame)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    detections: List[Tuple[float, float]] = []
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < MIN_AREA:
-            continue
-        m = cv2.moments(cnt)
-        if m["m00"] == 0:
-            continue
-        cx = float(m["m10"] / m["m00"])
-        cy = float(m["m01"] / m["m00"])
-        detections.append((cx, cy))
-
-    return _update_tracks(state, detections, now)
-
-
-def _ensure_resolution(cap: cv2.VideoCapture) -> None:
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
-
-
-def _emit_counts(counts: Dict[str, int]) -> None:
+def _emit_counts(counts: CountsDict) -> None:
     try:
-        _counts_q.put_nowait(counts.copy())
+        _counts_queue.put_nowait(counts.copy())
     except queue.Full:
         try:
-            _counts_q.get_nowait()
+            _counts_queue.get_nowait()
         except queue.Empty:
             pass
         try:
-            _counts_q.put_nowait(counts.copy())
+            _counts_queue.put_nowait(counts.copy())
         except queue.Full:
             pass
 
 
-def count_stream() -> Iterator[Dict[str, int]]:
-    """Yield car counts for the directions N, S, E and W.
-
-    The generator aggregates counts over :data:`PRINT_EVERY` seconds and yields
-    the totals for that window.  It also publishes the most recent snapshot to
-    :func:`get_counts_queue` for other modules.
-    """
+def count_stream() -> Iterator[CountsDict]:
+    """Yield car counts as dictionaries keyed by N, S, E, W."""
 
     cap = cv2.VideoCapture(CAM_INDEX)
     if not cap.isOpened():
         raise RuntimeError(f"Unable to open camera index {CAM_INDEX}.")
-
-    _ensure_resolution(cap)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
 
     ok, frame = cap.read()
     if not ok:
         cap.release()
-        raise RuntimeError("Failed to read initial frame from camera.")
+        raise RuntimeError("Unable to read initial frame.")
 
     rois = _select_or_load_rois(frame)
-    states = {name: _make_roi_state(name, rect) for name, rect in rois.items()}
-
+    states = {name: _make_state(name, rect) for name, rect in rois.items()}
+    window_counts: CountsDict = {"N": 0, "S": 0, "E": 0, "W": 0}
     last_emit = time.time()
-    window_counts = {"N": 0, "S": 0, "E": 0, "W": 0}
 
     try:
         while True:
@@ -219,36 +196,36 @@ def count_stream() -> Iterator[Dict[str, int]]:
                 roi_frame = frame[y : y + h, x : x + w]
                 if roi_frame.size == 0:
                     continue
-                inc = _process_roi(state, roi_frame, now)
+                detections = _detect(state, roi_frame)
+                inc = _update_tracks(state, detections, now)
                 if inc:
                     window_counts[name] += inc
-
             if now - last_emit >= PRINT_EVERY:
                 _emit_counts(window_counts)
                 print(f"Counts @ {time.strftime('%H:%M:%S')}: {window_counts}")
                 yield window_counts.copy()
-                window_counts = {key: 0 for key in window_counts}
+                window_counts = {k: 0 for k in window_counts}
                 last_emit = now
     finally:
         cap.release()
 
 
-def _run_viewer() -> None:
-    """Simple viewer that draws ROIs and live counts for manual inspection."""
+def run_viewer() -> None:
+    """Debug helper that overlays ROIs and live counts."""
 
     cap = cv2.VideoCapture(CAM_INDEX)
     if not cap.isOpened():
         raise RuntimeError(f"Unable to open camera index {CAM_INDEX}.")
-
-    _ensure_resolution(cap)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
 
     ok, frame = cap.read()
     if not ok:
         cap.release()
-        raise RuntimeError("Failed to read initial frame from camera.")
+        raise RuntimeError("Unable to read initial frame.")
 
     rois = _select_or_load_rois(frame)
-    states = {name: _make_roi_state(name, rect) for name, rect in rois.items()}
+    states = {name: _make_state(name, rect) for name, rect in rois.items()}
     counts = {"N": 0, "S": 0, "E": 0, "W": 0}
     last_emit = time.time()
 
@@ -257,12 +234,16 @@ def _run_viewer() -> None:
             ok, frame = cap.read()
             if not ok:
                 break
-            now = time.time()
             display = frame.copy()
+            now = time.time()
             for name, state in states.items():
                 x, y, w, h = state.rect
                 roi_frame = frame[y : y + h, x : x + w]
                 cv2.rectangle(display, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                detections = _detect(state, roi_frame)
+                inc = _update_tracks(state, detections, now)
+                if inc:
+                    counts[name] += inc
                 cv2.putText(
                     display,
                     f"{name}: {counts[name]}",
@@ -272,13 +253,10 @@ def _run_viewer() -> None:
                     (0, 255, 0),
                     2,
                 )
-                inc = _process_roi(state, roi_frame, now)
-                if inc:
-                    counts[name] += inc
             if now - last_emit >= PRINT_EVERY:
-                counts = {key: 0 for key in counts}
+                counts = {k: 0 for k in counts}
                 last_emit = now
-            cv2.imshow("Smart Road — Counts", display)
+            cv2.imshow("Smart Road - Counts", display)
             if cv2.waitKey(1) & 0xFF == 27:
                 break
     finally:
@@ -287,8 +265,4 @@ def _run_viewer() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        for _ in count_stream():
-            pass
-    except KeyboardInterrupt:
-        print("Stopped by user.")
+    run_viewer()
