@@ -1,246 +1,136 @@
-# Smart Adaptive Traffic Intersection - STEM Demo
+# Smart Road Traffic System 🚦
+# نظام الطريق الذكي
 
-> A complete, classroom-friendly project that uses **Python + OpenCV** to count cars, runs a simple **adaptive 2-phase algorithm** (NS vs EW), and controls **ESP32 traffic lights** and **line-follower smart cars** over **MQTT**.
-
----
-
-## Highlights
-
-* **Camera-based counting**: 4 manual ROIs (N/S/E/W), background subtraction, and a line-crossing counter.
-* **Adaptive timing**: green windows between 5-12 s based on live counts (short demo-friendly cycles).
-* **Simple IoT protocol**: one compact message for signals plus tiny GO/STOP messages for each car.
-* **Non-blocking FSM** on ESP32 (no `delay()`), clean pin maps, and ready-to-build wiring.
-* **Works with a free public broker**: `broker.emqx.io:1883`.
+[English](#english) | [العربية](#arabic)
 
 ---
 
-## Repository Layout
+<a name="english"></a>
+## 🇬🇧 English Section
 
-```
-/ (root)
-|-- vision_select_and_count.py     # OpenCV: select ROIs + count cars in N,S,E,W
-|-- algo_two_phase.py              # Timing planner (NS/EW)
-|-- iot_publisher.py               # Glues vision + algo; publishes MQTT to signals & cars
-|-- esp32_signals_controller.ino   # ESP32: subscribes 'signals/cycle', drives 4 traffic lights
-|-- esp32_car_linefollower.ino     # ESP32: car (3 IR sensors + L298N), subscribes 'cars/<dir>'
-|-- roi_config.json                # Auto-generated after first ROI selection
-`-- README.md                      # You are here
-```
+### Overview
+This project is a Smart Traffic Light System using Computer Vision and IoT. It monitors traffic density in 4 directions (N, S, E, W) using a camera and dynamically adjusts signal timings to optimize traffic flow. Data is sent to ESP32 controllers via MQTT.
 
----
+### 📂 File Structure
+- **`vision_select_and_count.py`**: Handles camera input, allows ROI selection, and counts vehicles using background subtraction.
+- **`algo_two_phase.py`**: Contains the logic for calculating traffic signal timings (Green/Red duration) based on vehicle counts.
+- **`iot_publisher.py`**: The main script that integrates vision and logic, then publishes commands to the MQTT broker.
+- **`test_iot.py`**: A simple script to test the MQTT connection without running the full vision system.
+- **`requirements.txt`**: Lists all Python libraries required to run the project.
+- **`roi_config.json`**: Stores the coordinates of the selected traffic zones (created automatically).
 
-## System Overview
+### Prerequisites
+- Python 3.8+
+- A webcam connected to your PC.
+- Internet connection (for MQTT).
 
-```
-               +-----------------------------+
-               |  Laptop (Python)            |
-               |  - OpenCV vision            |
-  Camera --->  |  - 2-phase algorithm (NS/EW)|  ---> MQTT "signals/cycle"
-               |  - MQTT publisher           |  ---> MQTT "cars/<dir>" (GO/STOP)
-               +-----------------------------+
-                           |  Wi-Fi / MQTT (broker.emqx.io:1883)
-                           v
-     +---------------------------+          +-------------------+   +-------------------+   +-------------------+
-     |  ESP32 Signals Controller |          | ESP32 Car (N dir) |   | ESP32 Car (S dir) |   | ESP32 Car (E dir) |
-     |  4x R/Y/G traffic lights  |          | Line follower     |   | Line follower     |   | Line follower     |
-     |  Non-blocking FSM         |          | (3 IR + L298N)    |   | (3 IR + L298N)    |   | (3 IR + L298N)    |
-     +---------------------------+          +-------------------+   +-------------------+   +-------------------+
-```
+### Installation
 
-* **Counting period**: ~1 Hz (once per second).
-* **Algorithm**: picks **NS or EW** first, computes `NS_green_ms` & `EW_green_ms` within 5-12 s.
-* **Safety**: 2 s amber + 1 s all-red between phases.
-* **Fail-safe**: if no new data arrives, the controller reverts to a default cycle.
-
----
-
-## Hardware
-
-### 1) Traffic Lights (ESP32)
-
-* **LEDs**: 4 directions x (Red, Yellow, Green) = 12 LEDs + 12 x 220 ohm resistors.
-* **Common GND**. For large LED stacks or 12 V loads, buffer the outputs with a ULN2803.
-
-**Default pin map (change at the top of `esp32_signals_controller.ino`):**
-
-| Direction | Red | Yellow | Green |
-| --------- | --: | -----: | ----: |
-| North     |  21 |     22 |    23 |
-| South     |  19 |     18 |     5 |
-| East      |  25 |     26 |    27 |
-| West      |  32 |     33 |     4 |
-
-### 2) Smart Cars (3 units, each ESP32 + L298N)
-
-* **Motors**: DC gear motors via L298N.
-* **Line sensors**: 3 IR sensors (Left / Center / Right) with a fixed threshold.
-* **Power**: each car has its own 6-9 V battery pack + switch.
-
-**Default pins per car:**
-
-| Module                   | Pin          |
-| ------------------------ | ------------ |
-| ENA (PWM)                | 25           |
-| IN1, IN2                 | 26, 27       |
-| ENB (PWM)                | 14           |
-| IN3, IN4                 | 12, 13       |
-| IR Left / Center / Right | 34 / 35 / 32 |
-
-(*Pins 34 and 35 are input-only on ESP32-perfect for analog IR sensors.*)
-
----
-
-## Network & MQTT
-
-* **Broker**: `broker.emqx.io`
-* **TCP Port**: `1883`
-* **Auth**: none (public test broker)
-
-**Topics**
-
-* **Signals**: `signals/cycle`
-
-  * Payload (single line):
-
+1.  **Install Dependencies:**
+    Open your terminal/command prompt in the project folder and run:
+    ```bash
+    pip install -r requirements.txt
     ```
-    CYCLE <ORDER> <NS_green_ms> <EW_green_ms> <amber_ms> <allred_ms>
+    *Note: If you encounter OpenCV errors, ensure you have `opencv-contrib-python` installed.*
+
+### Usage Instructions
+
+#### Step 1: Configure Vision (ROI Selection)
+Before running the system, you must define the Regions of Interest (ROIs) for the 4 directions.
+
+1.  Run the vision setup script:
+    ```bash
+    python vision_select_and_count.py
     ```
+2.  A camera window will open. Follow the on-screen prompts in the terminal:
+    -   Select the **North (N)** area and press `ENTER`.
+    -   Select the **South (S)** area and press `ENTER`.
+    -   Select the **East (E)** area and press `ENTER`.
+    -   Select the **West (W)** area and press `ENTER`.
+3.  The configuration will be saved to `roi_config.json`.
 
-    Example: `CYCLE NS 9000 6000 2000 1000`
+#### Step 2: Run the System
+To start monitoring traffic and controlling signals:
 
-* **Cars**: `cars/N`, `cars/S`, `cars/E`, `cars/W`
+1.  Run the main publisher script:
+    ```bash
+    python iot_publisher.py
+    ```
+2.  The system will:
+    -   Open the camera and count cars in the defined ROIs.
+    -   Calculate optimal Green/Red times.
+    -   Publish commands to the MQTT broker (Topic: `signals/cycle`).
 
-  * Payload: `GO <ms>` or `STOP`
-  * Example: `GO 9000`, `STOP`
-
-> Cars subscribe only to their own topic (e.g., the N-car listens to `cars/N`).
-
----
-
-## Software Setup (Laptop)
-
-**Requirements**
-
-* Python 3.10+
-* `pip install opencv-python numpy paho-mqtt`
-
-**Run order**
-
-1. `vision_select_and_count.py`
-
-   * First run: select 4 ROIs in the order **N, S, E, W**.
-   * ROIs are saved to `roi_config.json`.
-
-2. `iot_publisher.py`
-
-   * Imports the counts (1 Hz), runs the algorithm, and publishes MQTT updates to signals and cars.
-
-**Quick commands**
-
-```bash
-pip install opencv-python numpy paho-mqtt
-python vision_select_and_count.py    # pick ROIs & verify overlay looks right
-python iot_publisher.py              # starts publishing live cycles + GO/STOP
-```
+### Troubleshooting
+-   **OpenCV Error:** If you see an error about `cvShowImage` or UI, run:
+    ```bash
+    pip uninstall opencv-python opencv-python-headless
+    pip install opencv-contrib-python
+    ```
+-   **Reset ROIs:** To re-select areas, simply delete `roi_config.json` and run Step 1 again.
 
 ---
 
-## Algorithm (Short Demo Windows)
+<a name="arabic"></a>
+## 🇪🇬 القسم العربي
 
-* **Target ranges**:
-  * `NS_green_ms`, `EW_green_ms` between 5000 and 12000 ms.
-  * `Amber = 2000 ms`, `All-Red = 1000 ms`.
-* **2-phase rule**:
-  * Compute `NS = N + S` and `EW = E + W`; choose the larger (with a hysteresis of 2 cars) to run first.
-  * Green time scales with demand: base duration plus a gain factor times `(queue - average)`.
-* **Fairness**: hysteresis prevents flip-flop near ties; short periods keep the classroom demo lively.
+### نبذة عن المشروع
+هذا المشروع عبارة عن نظام إشارات مرور ذكي يعتمد على الرؤية الحاسوبية (Computer Vision) وإنترنت الأشياء (IoT). يقوم النظام بمراقبة كثافة السيارات في 4 اتجاهات (شمال، جنوب، شرق، غرب) باستخدام الكاميرا، ويقوم بضبط أوقات الإشارة تلقائياً لتقليل الازدحام. يتم إرسال الأوامر لوحدات التحكم (ESP32) عبر بروتوكول MQTT.
 
----
+### 📂 شرح الملفات
+- **`vision_select_and_count.py`**: مسؤول عن تشغيل الكاميرا، تحديد مناطق الطريق، وعد السيارات.
+- **`algo_two_phase.py`**: يحتوي على الخوارزمية التي تحسب الوقت المناسب للإشارة الخضراء والحمراء بناءً على عدد السيارات.
+- **`iot_publisher.py`**: الملف الرئيسي الذي يربط بين الرؤية والخوارزمية ويرسل الأوامر عبر الإنترنت (MQTT).
+- **`test_iot.py`**: كود بسيط لاختبار الاتصال بالسيرفر دون تشغيل الكاميرا.
+- **`requirements.txt`**: قائمة بالمكتبات اللازمة لتشغيل المشروع.
+- **`roi_config.json`**: ملف يتم إنشاؤه تلقائياً لحفظ إحداثيات المناطق التي قمت بتحديدها.
 
-## Controller Logic (ESP32, non-blocking)
+### المتطلبات
+- بايثون 3.8 أو أحدث.
+- كاميرا ويب متصلة بالكمبيوتر.
+- اتصال بالإنترنت (للاتصال بسيرفر MQTT).
 
-* Subscribes to `signals/cycle`.
-* Parses one line and stores a pending cycle.
-* Applies updates at the safe boundary (during all-red) or after finishing the current phase.
-* Drives 12 LEDs with the FSM:
-  1. `NS_G` -> `NS_Y` -> `ALL_RED`
-  2. `EW_G` -> `EW_Y` -> `ALL_RED`
-* If no new cycles arrive for a while, the default cycle continues.
+### التثبيت
 
----
+1.  **تثبيت المكتبات المطلوبة:**
+    افتح التيرمينال في مجلد المشروع ونفذ الأمر التالي:
+    ```bash
+    pip install -r requirements.txt
+    ```
+    *ملاحظة: تأكد من تثبيت `opencv-contrib-python` لتجنب مشاكل واجهة الكاميرا.*
 
-## Smart Cars Behavior
+### تعليمات التشغيل
 
-* Each car subscribes to `cars/<dir>`:
-  * `GO <ms>` enables the line follower for `<ms>` with basic left/right correction from the 3 IR sensors.
-  * `STOP` immediately sets PWM to zero.
-* Simple, robust, and perfect for a classroom demo.
+#### الخطوة 1: إعداد الرؤية (تحديد المناطق)
+قبل تشغيل النظام، يجب تحديد مناطق الطريق الأربعة (ROIs) التي سيتم مراقبتها.
 
----
+1.  شغل كود الإعداد:
+    ```bash
+    python vision_select_and_count.py
+    ```
+2.  ستظهر نافذة الكاميرا. اتبع التعليمات في التيرمينال:
+    -   حدد منطقة **الشمال (N)** بمستطيل ثم اضغط `ENTER`.
+    -   حدد منطقة **الجنوب (S)** بمستطيل ثم اضغط `ENTER`.
+    -   حدد منطقة **الشرق (E)** بمستطيل ثم اضغط `ENTER`.
+    -   حدد منطقة **الغرب (W)** بمستطيل ثم اضغط `ENTER`.
+3.  سيتم حفظ الإعدادات تلقائياً في ملف `roi_config.json`.
 
-## First Demo Checklist
+#### الخطوة 2: تشغيل النظام
+لبدء مراقبة المرور والتحكم في الإشارات:
 
-1. **Vision overlay looks correct**:
-   * ROIs align with the four approaches to the intersection.
-   * Counters increase when toy cars move toward the counting line.
-2. **MQTT visible** (optional):
-   * Use IoT MQTT Panel or the broker web console to observe:
-     * `signals/cycle` messages.
-     * `cars/N`, `cars/S`, `cars/E`, `cars/W` GO/STOP commands.
-3. **Signals**:
-   * LEDs switch NS -> amber -> all-red -> EW -> amber -> all-red with the published durations.
-4. **Cars**:
-   * Start/stop per their topics.
-   * Tune `PWM_SPEED` and `IR_TH` per car if needed.
+1.  شغل الملف الرئيسي:
+    ```bash
+    python iot_publisher.py
+    ```
+2.  سيقوم النظام بـ:
+    -   فتح الكاميرا وعد السيارات في المناطق المحددة.
+    -   حساب الوقت المناسب للإشارة الخضراء والحمراء.
+    -   إرسال الأوامر لسيرفر MQTT (على التوبيك `signals/cycle`).
 
----
-
-## Tuning Tips
-
-* **Counting too low?** Increase ROI size slightly, lower `MIN_AREA`, move `LINE_POS` closer to the flow, and ensure steady lighting.
-* **Over-counting?** Increase `BAND_FRAC` slightly or move the counting line farther from noisy zones.
-* **Line follower drifts?** Reduce `PWM_SPEED`, re-tape the track (solid contrast), and adjust `IR_TH`.
-* **Broker hiccups?** Public brokers can drop packets; keep messages short (QoS 1 is already in use where needed).
-
----
-
-## Bill of Materials (suggested)
-
-* 1 x ESP32 DevKit (traffic lights)
-* 3 x ESP32 DevKit (cars)
-* 3 x L298N motor drivers
-* 3 x Robot chassis kits (2 DC motors + wheels + frame)
-* 3 x Battery packs (6-9 V) + switches
-* 12 x LEDs (R/Y/G for 4 directions)
-* 12 x 220 ohm resistors
-* Jumper wires, breadboards, and common ground rails
-* Printed line track (black line on white background)
-
----
-
-## FAQ
-
-* **Why only two phases (NS & EW)?**  
-  It is the safest, simplest non-conflicting scheme for a 4-way demo with one camera. Extend to 4 phases later if you like.
-
-* **Why send durations rather than timestamps?**  
-  Avoids clock sync issues; the controller schedules transitions relative to `millis()`.
-
-* **Can cars obey lane-specific signals?**  
-  Yes-create per-lane topics (e.g., `cars/N/left`) and extend the protocol. Start simple first.
-
----
-
-## What to Edit Quickly
-
-* In the `.ino` files: set `WIFI_SSID` and `WIFI_PASS`.
-* In `esp32_car_linefollower.ino` for each car: set `CAR_TOPIC` (`cars/N`, `cars/S`, or `cars/E`) and optionally `PWM_SPEED` / `IR_TH`.
-
----
-
-## Questions / Help
-
-If you have any questions, want to report an issue, or need a quick hand setting things up, reach out on WhatsApp:
-
-**Chat on WhatsApp**  
-https://wa.me/201064535868
+### حل المشاكل
+-   **خطأ OpenCV:** إذا ظهر خطأ يتعلق بـ `cvShowImage` أو الواجهة، نفذ الأوامر التالية لإصلاح المكتبة:
+    ```bash
+    pip uninstall opencv-python opencv-python-headless
+    pip install opencv-contrib-python
+    ```
+-   **إعادة تحديد المناطق:** إذا أردت تغيير المناطق، قم بحذف ملف `roi_config.json` ثم كرر الخطوة 1.

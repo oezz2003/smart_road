@@ -51,17 +51,22 @@ def _select_or_load_rois(frame) -> Dict[str, Tuple[int, int, int, int]]:
                 )
         return rois
 
-    print("Select ROIs in order N, S, E, W (ENTER after each, ESC when done).")
-    rois = cv2.selectROIs("Select 4 ROIs", frame, showCrosshair=True, fromCenter=False)
-    cv2.destroyWindow("Select 4 ROIs")
-    if len(rois) != 4:
-        raise RuntimeError("Need exactly 4 ROIs.")
-    mapping = {
-        "N": tuple(map(int, rois[0])),
-        "S": tuple(map(int, rois[1])),
-        "E": tuple(map(int, rois[2])),
-        "W": tuple(map(int, rois[3])),
-    }
+    print("Select ROIs in order N, S, E, W.")
+    mapping = {}
+    for direction in ["N", "S", "E", "W"]:
+        print(f"Select ROI for {direction} then press SPACE or ENTER. Press c to cancel.")
+        # selectROI returns (x, y, w, h)
+        rect = cv2.selectROI(f"Select ROI for {direction}", frame, showCrosshair=True, fromCenter=False)
+        # If user cancels or selects empty, rect might be all 0s. 
+        # cv2.selectROI returns (0,0,0,0) if cancelled usually? Or just closes.
+        # Let's assume user selects something.
+        if rect == (0, 0, 0, 0):
+             print(f"Selection for {direction} cancelled or empty. Exiting.")
+             raise RuntimeError("ROI selection cancelled.")
+        
+        mapping[direction] = tuple(map(int, rect))
+        cv2.destroyWindow(f"Select ROI for {direction}")
+
     with open(ROI_CFG, "w", encoding="utf-8") as fh:
         json.dump(mapping, fh, indent=2)
     print(f"Saved ROI configuration to {ROI_CFG}.")
